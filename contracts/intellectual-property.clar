@@ -333,3 +333,310 @@
     (err "License not found")
   )
 )
+
+;; Public functions
+
+;; Register a new IP asset
+(define-public (register-ip-asset
+  (title (string-utf8 100))
+  (description (string-utf8 1000))
+  (asset-type uint)
+  (content-hash (buff 32))
+  (metadata-url (string-utf8 256))
+  (is-transferable bool)
+  (allowed-license-types (list 10 uint))
+)
+  (let
+    (
+      (asset-id (var-get next-asset-id))
+      (creator-count (default-to { count: u0 } (map-get? creator-asset-count { creator: tx-sender })))
+    )
+    
+    ;; Validate asset type
+    (asserts! (<= asset-type ASSET-TYPE-OTHER) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Create the asset
+    (map-set ip-assets
+      { asset-id: asset-id }
+      {
+        title: title,
+        description: description,
+        asset-type: asset-type,
+        creator-principal: tx-sender,
+        creation-date: block-height,
+        registration-date: block-height,
+        content-hash: content-hash,
+        metadata-url: metadata-url,
+        license-count: u0,
+        is-transferable: is-transferable,
+        transfer-history: (list),
+        current-owner: tx-sender,
+        is-collaborative: false,
+        collaboration-id: none,
+        in-dispute: false,
+        dispute-id: none,
+        allowed-license-types: allowed-license-types,
+        inheritance-beneficiary: none
+      }
+    )
+    
+    ;; Add to creator's assets
+    (map-set creator-assets
+      { creator: tx-sender, index: (get count creator-count) }
+      { asset-id: asset-id }
+    )
+    
+    ;; Update creator's asset count
+    (map-set creator-asset-count
+      { creator: tx-sender }
+      { count: (+ (get count creator-count) u1) }
+    )
+    
+    ;; Increment asset ID
+    (var-set next-asset-id (+ asset-id u1))
+    
+    (ok asset-id)
+  )
+)
+
+;; Create a collaboration for an IP asset
+(define-public (create-collaboration
+  (asset-id uint)
+  (collaborators (list 10 principal))
+  (royalty-splits (list 10 { collaborator: principal, split-percent: uint }))
+  (decision-threshold uint)
+  (collaboration-terms (string-utf8 1000))
+  (agreement-hash (buff 32))
+)
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (collaboration-id (var-get next-collaboration-id))
+    )
+    
+    ;; Check if caller is owner or original creator
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Ensure asset is not already collaborative
+    (asserts! (not (get is-collaborative asset)) (err ERR-ALREADY-COLLABORATOR))
+    
+    ;; Validate collaborator list includes the creator
+    (asserts! (is-some (index-of collaborators tx-sender)) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Validate royalty splits add up to 100%
+    (asserts! (is-eq (fold add-royalty-percent royalty-splits u0) u10000) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Create collaboration
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      {
+        asset-id: asset-id,
+        creation-date: block-height,
+        last-modified: block-height,
+        collaborators: collaborators,
+        royalty-splits: royalty-splits,
+        decision-threshold: decision-threshold,
+        collaboration-terms: collaboration-terms,
+        agreement-hash: agreement-hash,
+        administrator: tx-sender,
+        is-active: true
+      }
+    )
+    
+    ;; Update asset to mark as collaborative
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        is-collaborative: true,
+        collaboration-id: (some collaboration-id)
+      })
+    )
+    
+    ;; Increment collaboration ID
+    (var-set next-collaboration-id (+ collaboration-id u1))
+    
+    (ok collaboration-id)
+  )
+)
+
+;; Helper function to add royalty percentages
+(define-private (add-royalty-percent (royalty-split { collaborator: principal, split-percent: uint }) (total uint))
+  (+ total (get split-percent royalty-split))
+)
+
+;; Create a new license
+(define-public (create-license
+  (asset-id uint)
+  (licensee principal)
+  (license-type uint)
+  (license-terms (string-utf8 1000))
+  (royalty-percent uint)
+  (upfront-payment uint)
+  (start-date uint)
+  (end-date (optional uint))
+  (territory (string-utf8 100))
+  (usage-limits (optional uint))
+  (payment-schedule (string-utf8 256))
+  (license-hash (buff 32))
+  (is-sublicensable bool)
+  (termination-conditions (string-utf8 500))
+)
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (license-id (var-get next-license-id))
+    )
+    
+    ;; Check if caller is current owner
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; If collaborative, check if caller is a collaborator
+    (if (get is-collaborative asset)
+      (asserts! (is-collaborator asset-id tx-sender) (err ERR-NOT-AUTHORIZED))
+      true
+    )
+    
+    ;; Check if license type is allowed
+    (asserts! (is-some (index-of (get allowed-license-types asset) license-type)) (err ERR-INVALID-LICENSE-TERMS))
+    
+    ;; Check if royalty percentage is within limits
+    (asserts! (<= royalty-percent (var-get max-royalty-percent)) (err ERR-ROYALTY-EXCEEDS-MAX))
+    
+    ;; Process upfront payment if any
+    (if (> upfront-payment u0)
+      (try! (stx-transfer? upfront-payment licensee tx-sender))
+      true
+    )
+    
+    ;; Create the license
+    (map-set licenses
+      { license-id: license-id }
+      {
+        asset-id: asset-id,
+        licensor: tx-sender,
+        licensee: licensee,
+        license-type: license-type,
+        license-terms: license-terms,
+        royalty-percent: royalty-percent,
+        upfront-payment: upfront-payment,
+        start-date: start-date,
+        end-date: end-date,
+        territory: territory,
+        usage-limits: usage-limits,
+        usage-count: u0,
+        payment-schedule: payment-schedule,
+        status: LICENSE-STATUS-ACTIVE,
+        creation-date: block-height,
+        last-modified: block-height,
+        license-hash: license-hash,
+        is-sublicensable: is-sublicensable,
+        sublicense-parent: none,
+        termination-conditions: termination-conditions
+      }
+    )
+    
+    ;; Add to asset's licenses
+    (map-set asset-licenses
+      { asset-id: asset-id, index: (get license-count asset) }
+      { license-id: license-id }
+    )
+    
+    ;; Update asset license count
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        license-count: (+ (get license-count asset) u1)
+      })
+    )
+    
+    ;; Add to licensee's licenses
+    (let
+      (
+        (licensee-count (default-to { count: u0 } (map-get? licensee-license-count { licensee: licensee })))
+      )
+      (map-set licensee-licenses
+        { licensee: licensee, index: (get count licensee-count) }
+        { license-id: license-id }
+      )
+      
+      (map-set licensee-license-count
+        { licensee: licensee }
+        { count: (+ (get count licensee-count) u1) }
+      )
+    )
+    
+    ;; Initialize royalty payment count
+    (map-set royalty-payment-count
+      { license-id: license-id }
+      { count: u0 }
+    )
+    
+    ;; Increment license ID
+    (var-set next-license-id (+ license-id u1))
+    
+    (ok license-id)
+  )
+)
+
+;; Use a license (increment usage count and verify license is valid)
+(define-public (use-license (license-id uint))
+  (let
+    (
+      (license (unwrap! (get-license license-id) (err ERR-LICENSE-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is the licensee
+    (asserts! (is-eq tx-sender (get licensee license)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if license is active
+    (asserts! (is-license-active license-id) (err ERR-LICENSE-NOT-ACTIVE))
+    
+    ;; Check if usage is within limits
+    (match (get usage-limits license)
+      limits (asserts! (< (get usage-count license) limits) (err ERR-LICENSE-EXPIRED))
+      true
+    )
+    
+    ;; Update usage count
+    (map-set licenses
+      { license-id: license-id }
+      (merge license {
+        usage-count: (+ (get usage-count license) u1),
+        last-modified: block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Terminate a license
+(define-public (terminate-license (license-id uint))
+  (let
+    (
+      (license (unwrap! (get-license license-id) (err ERR-LICENSE-NOT-FOUND)))
+      (asset-id (get asset-id license))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+    )
+    ;; Check if caller is licensor or contract owner
+    (asserts! (or 
+               (is-eq tx-sender (get licensor license))
+               (is-eq tx-sender (var-get contract-owner))
+              ) 
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if license is not already terminated
+    (asserts! (not (is-eq (get status license) LICENSE-STATUS-TERMINATED)) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update license status
+    (map-set licenses
+      { license-id: license-id }
+      (merge license {
+        status: LICENSE-STATUS-TERMINATED,
+        last-modified: block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
