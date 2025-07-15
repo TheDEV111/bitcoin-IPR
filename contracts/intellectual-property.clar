@@ -129,3 +129,207 @@
     is-active: bool
   }
 )
+
+;; Licensing agreements
+(define-map licenses
+  { license-id: uint }
+  {
+    asset-id: uint,
+    licensor: principal,
+    licensee: principal,
+    license-type: uint,
+    license-terms: (string-utf8 1000),
+    royalty-percent: uint, ;; Basis points
+    upfront-payment: uint,
+    start-date: uint,
+    end-date: (optional uint),
+    territory: (string-utf8 100),
+    usage-limits: (optional uint),
+    usage-count: uint,
+    payment-schedule: (string-utf8 256),
+    status: uint,
+    creation-date: uint,
+    last-modified: uint,
+    license-hash: (buff 32),
+    is-sublicensable: bool,
+    sublicense-parent: (optional uint),
+    termination-conditions: (string-utf8 500)
+  }
+)
+
+;; Map of licenses by asset
+(define-map asset-licenses
+  { asset-id: uint, index: uint }
+  { license-id: uint }
+)
+
+;; Map of licenses by licensee
+(define-map licensee-licenses
+  { licensee: principal, index: uint }
+  { license-id: uint }
+)
+
+;; Map to track license counts for a licensee
+(define-map licensee-license-count
+  { licensee: principal }
+  { count: uint }
+)
+
+;; Royalty payments
+(define-map royalty-payments
+  { license-id: uint, payment-index: uint }
+  {
+    amount: uint,
+    payment-date: uint,
+    payment-period-start: uint,
+    payment-period-end: uint,
+    paid-by: principal,
+    received-by: principal,
+    transaction-id: (buff 32)
+  }
+)
+
+;; Map to track royalty payment counts
+(define-map royalty-payment-count
+  { license-id: uint }
+  { count: uint }
+)
+
+;; IP Transfers
+(define-map ip-transfers
+  { transfer-id: uint }
+  {
+    asset-id: uint,
+    from-principal: principal,
+    to-principal: principal,
+    transfer-price: uint,
+    transfer-date: (optional uint),
+    request-date: uint,
+    status: uint,
+    transfer-terms: (string-utf8 500),
+    requires-approval: bool,
+    approved-by: (list 10 principal), ;; For collaborative assets
+    transfer-hash: (buff 32),
+    retains-royalties: bool ;; If the original creator still receives royalties
+  }
+)
+
+;; Dispute records
+(define-map disputes
+  { dispute-id: uint }
+  {
+    asset-id: uint,
+    related-license-id: (optional uint),
+    related-transfer-id: (optional uint),
+    raised-by: principal,
+    raised-against: principal,
+    dispute-type: (string-utf8 50),
+    dispute-description: (string-utf8 1000),
+    evidence-hash: (buff 32),
+    status: uint,
+    creation-date: uint,
+    resolution-date: (optional uint),
+    resolution-notes: (optional (string-utf8 1000)),
+    arbiter: (optional principal)
+  }
+)
+
+;; Read-only functions
+
+;; Get IP asset details
+(define-read-only (get-ip-asset (asset-id uint))
+  (map-get? ip-assets { asset-id: asset-id })
+)
+
+;; Get collaboration details
+(define-read-only (get-collaboration (collaboration-id uint))
+  (map-get? collaborations { collaboration-id: collaboration-id })
+)
+
+;; Get license details
+(define-read-only (get-license (license-id uint))
+  (map-get? licenses { license-id: license-id })
+)
+
+;; Get transfer details
+(define-read-only (get-transfer (transfer-id uint))
+  (map-get? ip-transfers { transfer-id: transfer-id })
+)
+
+;; Get dispute details
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+;; Check if license is active
+(define-read-only (is-license-active (license-id uint))
+  (match (get-license license-id)
+    license
+    (let
+      (
+        (status (get status license))
+        (current-block block-height)
+        (license-expired
+          (match (get end-date license)
+            end-date (>= current-block end-date)
+            false
+          )
+        )
+      )
+      (and
+        (is-eq status LICENSE-STATUS-ACTIVE)
+        (not license-expired)
+        (or
+          (is-none (get usage-limits license))
+          (< (get usage-count license) (default-to u0 (get usage-limits license)))
+        )
+      )
+    )
+    false
+  )
+)
+
+;; Check if principal is a collaborator
+(define-read-only (is-collaborator (asset-id uint) (user principal))
+  (match (get-ip-asset asset-id)
+    asset
+    (match (get collaboration-id asset)
+      collab-id
+      (match (get-collaboration collab-id)
+        collaboration
+        (default-to false (some (is-some (index-of (get collaborators collaboration) user))))
+        false
+      )
+      false
+    )
+    false
+  )
+)
+
+;; Calculate royalty distribution for a payment
+(define-read-only (calculate-royalty-distribution (license-id uint) (payment-amount uint))
+  (match (get-license license-id)
+    license
+    (let
+      (
+        (asset-id (get asset-id license))
+        (asset (unwrap! (get-ip-asset asset-id) (err "Asset not found")))
+      )
+      (if (get is-collaborative asset)
+        ;; Handle collaborative asset
+        (match (get collaboration-id asset)
+          collaboration-id
+          (match (get-collaboration collaboration-id)
+            collaboration
+            (ok (get royalty-splits collaboration))
+            (err "Collaboration not found")
+          )
+          (err "Collaboration ID not found")
+        )
+        ;; Single creator - return 100% to owner
+        (ok (list { collaborator: (get current-owner asset), split-percent: u10000 }))
+      )
+    )
+    (err "License not found")
+  )
+)
